@@ -32,3 +32,6 @@ __pycache__/
 
 *.pem
 *.key
+
+# 7-Zip 解包组件属于分发必需文件，不属于构建产物
+!assets/setup/7zip/7za.exe
