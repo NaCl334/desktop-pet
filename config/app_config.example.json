@@ -1,0 +1,41 @@
+{
+  "autonomous_conversation": {
+    "enabled": false,
+    "interval_minutes": 60,
+    "vision_enabled": false
+  },
+  "autostart": {
+    "enabled": false
+  },
+  "shortcuts": {
+    "toggle_topmost": "Ctrl+Shift+H",
+    "screenshot": "Alt+q",
+    "quit": "Alt+1"
+  },
+  "operation": {
+    "usage": {
+      "drag": "鼠标左键",
+      "context_menu": "鼠标右键",
+      "resize": "鼠标左键双击"
+    }
+  },
+  "screenshot_directory": "data/screenshots",
+  "voice_directory": "data/voices",
+  "runtime_context": {
+    "region_override": ""
+  },
+  "conversation_model": {
+    "provider": "",
+    "base_url": "",
+    "model": "",
+    "api_key": "",
+    "api_key_env": ""
+  },
+  "vision_model": {
+    "provider": "",
+    "base_url": "",
+    "model": "",
+    "api_key": "",
+    "api_key_env": ""
+  }
+}

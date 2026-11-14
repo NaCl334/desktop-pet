@@ -1,0 +1,11 @@
+{
+  "engine": "local_api_v2",
+  "host": "127.0.0.1",
+  "port": 9880,
+  "python": "engines/gpt_sovits/runtime/python.exe",
+  "api_script": "engines/gpt_sovits/start_api.py",
+  "tts_config": "engines/gpt_sovits/tts_infer_project.yaml",
+  "device": "auto",
+  "enabled": false,
+  "characters": {}
+}
