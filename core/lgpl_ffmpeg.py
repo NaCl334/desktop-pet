@@ -10,22 +10,28 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import uuid
 from urllib.error import URLError
 import zipfile
 
 from core.config import ROOT
 
 PACKAGE = {
-    "filename": "ffmpeg-N-128889-g88c46fce27-win64-lgpl.zip",
-    "url": "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-11-13-12-43/ffmpeg-N-128889-g88c46fce27-win64-lgpl.zip",
-    "size": 175562391,
-    "sha256": "a0a6da9ceded9f6e3b84eb4216485726582a93abc44b7a0befa9b7909ff1a241",
+    # Upstream retains the final build of each month for two years. Pin that
+    # asset rather than one of the rolling 14 daily builds or mutable latest.
+    "filename": "ffmpeg-N-128227-g4811625b5f-win64-lgpl.zip",
+    "url": "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-10-31-12-59/ffmpeg-N-128227-g4811625b5f-win64-lgpl.zip",
+    "api_url": "https://api.github.com/repos/FFmpeg-Builds/FFmpeg-Builds/releases/assets/695397317",
+    "size": 175264885,
+    "sha256": "6550f7abc950128fbb0069b4552f2972baccf5fbd819f2fd0abbe4ceb8d48734",
     "files": {
-        "ffmpeg.exe": "ee4f488cd77b41b1e11a54ea0b8b006e71ba829bad77821992abe5d1ac4866bb",
-        "ffprobe.exe": "e9f05a217207ea0b9887f1ec026e24001e3ccd222b05951b5f0d79bfecfd1cd8",
+        "ffmpeg.exe": "f661607511f91654f369fd7ae270f95f0382bd4dc722c5f3b502de92f33f633f",
+        "ffprobe.exe": "915962ff46aab2cc4aefcb9c9856945ff448c90064252eb9ab17b817c5a7e360",
     },
-    "source": "https://github.com/FFmpeg-Builds/FFmpeg-Builds/tree/autobuild-2026-11-13-12-43",
+    "source": "https://github.com/FFmpeg-Builds/FFmpeg-Builds/tree/autobuild-2026-10-31-12-59",
     "license": "LGPL-3.0-or-later",
+    "release_date": "2026-10-31",
+    "review_before": "2028-09-30",
 }
 
 
@@ -49,8 +55,60 @@ def _probe(executable):
     return result.stdout
 
 
-def install_lgpl_tools(engine, progress=None, cancel_event=None):
+def obtain_lgpl_archive(progress=None, cancel_event=None):
     from core.installer import SetupError, _check_cancel, _notify, download_verified, verify_sha256
+    _check_cancel(cancel_event)
+    archive = ROOT / "setup_components" / PACKAGE["filename"]
+    if archive.is_file():
+        _notify(progress, "正在校验随包 FFmpeg 音频工具…", 71)
+        verify_sha256(archive, PACKAGE["sha256"], cancel_event)
+        if archive.stat().st_size != PACKAGE["size"]:
+            raise SetupError("随包 LGPL 工具的文件大小不正确。")
+        return archive
+    archive = ROOT / "temp/setup_downloads" / PACKAGE["filename"]
+    if archive.is_file():
+        # Reuse the prefetched archive without moving progress backwards after
+        # voice extraction. An invalid cache still goes through normal repair.
+        _notify(progress, "正在校验已下载的 FFmpeg 音频工具…")
+        try:
+            verify_sha256(archive, PACKAGE["sha256"], cancel_event)
+            if archive.stat().st_size == PACKAGE["size"]:
+                return archive
+        except SetupError:
+            _check_cancel(cancel_event)
+    last_error = None
+    # The official API redirects to the same immutable release asset without
+    # requiring access to github.com. Refresh signed redirects on each retry.
+    endpoints = ("api_url", "url", "api_url")
+    for attempt, key in enumerate(endpoints, 1):
+        _check_cancel(cancel_event)
+        url = PACKAGE[key]
+        headers = None
+        label = "官方直链"
+        if key == "api_url":
+            url += "?download=1&request={}".format(uuid.uuid4().hex)
+            headers = {"Accept": "application/octet-stream"}
+            label = "官方 API 通道"
+        _notify(progress, "正在准备 FFmpeg 音频工具：{}（{}/3）…".format(label, attempt), 71)
+
+        def downloaded(received, total):
+            _notify(progress, "正在下载 FFmpeg 音频工具：{:.1f} / {:.1f} MB".format(
+                received / 1e6, total / 1e6), 71 + 3 * received / max(total, 1))
+
+        try:
+            return download_verified(url, archive, PACKAGE["sha256"], progress=downloaded,
+                cancel_event=cancel_event, expected_size=PACKAGE["size"], request_headers=headers)
+        except (OSError, SetupError, URLError) as error:
+            _check_cancel(cancel_event)
+            last_error = error
+    raise SetupError("FFmpeg 音频工具下载失败（官方通道已尝试 3 次）。"
+        "已保留 GPT-SoVITS 主包和工具下载进度，无需重新下载主包。"
+        "请检查网络后重试；也可将原版 {} 放入安装目录的 setup_components 文件夹。原因：{}".format(
+            PACKAGE["filename"], last_error)) from last_error
+
+
+def install_lgpl_tools(engine, progress=None, cancel_event=None):
+    from core.installer import SetupError, _check_cancel
     engine = Path(engine)
     _check_cancel(cancel_event)
     candidates = [engine / name for name in PACKAGE["files"]]
@@ -61,24 +119,7 @@ def install_lgpl_tools(engine, progress=None, cancel_event=None):
             _digest(p) == PACKAGE["files"][p.name] for p in active):
         _probe(canonical / "ffmpeg.exe")
         return canonical
-
-    archive = ROOT / "setup_components" / PACKAGE["filename"]
-    if archive.is_file():
-        verify_sha256(archive, PACKAGE["sha256"], cancel_event)
-        if archive.stat().st_size != PACKAGE["size"]:
-            raise SetupError("随包 LGPL 工具的文件大小不正确。")
-    else:
-        archive = ROOT / "temp/setup_downloads" / PACKAGE["filename"]
-        for attempt in range(3):
-            _check_cancel(cancel_event)
-            _notify(progress, "正在下载并校验 LGPL 语音工具（{}/3）…".format(attempt + 1))
-            try:
-                download_verified(PACKAGE["url"], archive, PACKAGE["sha256"],
-                                  cancel_event=cancel_event, expected_size=PACKAGE["size"])
-                break
-            except (OSError, SetupError, URLError):
-                if attempt == 2:
-                    raise
+    archive = obtain_lgpl_archive(progress, cancel_event)
 
     # Verify every file and executable before replacing any existing tool.
     with tempfile.TemporaryDirectory(prefix="ffmpeg_lgpl_", dir=archive.parent) as directory:

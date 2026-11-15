@@ -72,6 +72,7 @@ from ui.pet_toolbar import PetToolbar
 from ui.voice_service_status import VoiceServicePanel, VoiceStartupNotice
 from core.voice_service_repair import (classify_voice_issue, start_managed_service, repair_environment,
                                        diagnostic_position, diagnostic_since)
+from core.installer import SetupError
 from core.user_address import (
     address_settings, resolve_user_address, address_speech_text, address_preview_text,
     protect_address_for_speech, restore_address_speech, address_needs_japanese_translation,
@@ -162,7 +163,7 @@ from core.reminder_commands import (
     parse_repeat_count,
 )
 from core.tray import WindowsTrayIcon
-from core.uninstaller import is_release_install, schedule_release_uninstall
+from core.uninstaller import is_release_install, schedule_release_uninstall, external_work_directory
 from ui.setup_wizard import SetupWizard
 from ui.dropdown_style import install_dropdown_styles
 from ui.action_menu import ActionMenu
@@ -10664,10 +10665,20 @@ class DesktopPetApp(object):
         status = getattr(self, "_tts_service_status", {})
         from core.voice_service_repair import local_environment_status
         if isinstance(self.gpt_sovits_client, GPTSoVITSClient):
-            status = local_environment_status(self.gpt_sovits_client) or status
+            status = local_environment_status(self.gpt_sovits_client, failure=status) or status
         install = status.get("action") == "install"
         repair = status.get("action") == "repair"
         environment = repair and status.get("environment_repair", False)
+        if install or environment:
+            from core.installer import SetupError, preflight_space
+            try:
+                preflight_space()
+            except (SetupError, OSError) as error:
+                from core.voice_service_repair import installation_failure
+                self._tts_service_status = installation_failure(error, install)
+                messagebox.showerror("语音环境空间检查", str(error),
+                    parent=getattr(self, "_control_dialog", None) or self.root)
+                return
         if (install or environment) and not messagebox.askyesno("安装语音服务" if install else "修复语音环境",
             ("将安装本地语音运行环境，安装完成后自动启动。\n\n" if install else
              "将检查并重新部署本地语音环境，保留角色模型、参考音频和聊天记录。\n\n") +
@@ -10688,7 +10699,8 @@ class DesktopPetApp(object):
             return
         if not repair_environment_required and not install_environment_required and isinstance(self.gpt_sovits_client, GPTSoVITSClient):
             from core.voice_service_repair import local_environment_status
-            environment = local_environment_status(self.gpt_sovits_client)
+            environment = local_environment_status(self.gpt_sovits_client,
+                failure=getattr(self, "_tts_service_status", None))
             if environment:
                 self._tts_service_status = environment
                 return
@@ -10708,6 +10720,9 @@ class DesktopPetApp(object):
                     client.stop()
                     def progress(text, percent=None, *args):
                         if not getattr(self, "_quitting", False):
+                            if isinstance(text, dict):
+                                percent = text.get("percent", percent)
+                                text = text.get("text", "")
                             self._tts_service_status = {"state": "starting", "text": str(text),
                                 "started_at": started_at, "percent": percent,
                                 "operation": "install" if install_environment_required else "repair"}
@@ -10751,11 +10766,14 @@ class DesktopPetApp(object):
                                 "environment_repair": issue.environment_repair,
                                 "action_label": "修复并启动" if issue.action == "repair" else "再次检查"}
                             break
+            except SetupError as error:
+                from core.voice_service_repair import installation_failure
+                self._runtime_errors.append("语音环境配置失败：{}".format(error))
+                self._tts_service_status = installation_failure(error, install_environment_required)
             except Exception as error:
-                self._runtime_errors.append("语音环境修复失败：{}".format(type(error).__name__))
-                self._tts_service_status = {"state": "failed", "text": "语音环境{}未完成，原有角色资料保留。请检查网络、磁盘空间后重试。".format("安装" if install_environment_required else "修复"),
-                    "action": "install" if install_environment_required else "repair", "environment_repair": not install_environment_required,
-                    "action_label": "重新安装语音服务" if install_environment_required else "修复并启动"}
+                from core.voice_service_repair import installation_failure
+                self._runtime_errors.append("语音环境配置失败：{!r}".format(error))
+                self._tts_service_status = installation_failure(error, install_environment_required)
             finally:
                 self._tts_service_starting = False
 
@@ -12176,8 +12194,7 @@ class DesktopPetApp(object):
             self._environment_report = report
             profile = self.store.settings.get("setup_profile", "")
             completed = bool(self.store.settings.get("setup_wizard_completed", False))
-            dismissed = bool(self.store.settings.get("setup_wizard_dismissed", False))
-            if completed or dismissed:
+            if completed:
                 return
             if profile_ready(report, "full") and list_characters():
                 self.store.save_settings(
@@ -12193,6 +12210,18 @@ class DesktopPetApp(object):
                 lambda report=report: self._show_setup_wizard(report),
             )
 
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _reopen_setup_wizard(self):
+        self.store.save_settings({"setup_wizard_dismissed": False})
+        if getattr(self, "_setup_wizard_open", False):
+            wizard = getattr(self, "_setup_wizard", None)
+            if wizard:
+                wizard.show()
+            return
+        def worker():
+            report = detect_environment()
+            self._safe_root_after(0, lambda: self._show_setup_wizard(report))
         threading.Thread(target=worker, daemon=True).start()
 
     def _show_setup_wizard(self, report):
@@ -12216,7 +12245,9 @@ class DesktopPetApp(object):
 
         def dismissed():
             if self.root.winfo_exists():
-                self.store.save_settings({"setup_wizard_dismissed": True})
+                self.store.save_settings({"setup_wizard_dismissed": False})
+                if not self.store.settings.get("setup_wizard_completed", False):
+                    self.quit_app()
 
         wizard = SetupWizard(
             self.root,
@@ -23647,6 +23678,10 @@ class DesktopPetApp(object):
         self._control_draft_active = False
         self._control_snapshot = None
         self._control_status.set("正在退出并删除当前桌宠文件夹……")
+        try:
+            os.chdir(external_work_directory(ROOT))
+        except OSError as error:
+            self._runtime_errors.append("卸载时切换工作目录失败：{}".format(error))
         self.quit_app()
 
     def _export_current_character_package(self, character_id=None):
@@ -25601,13 +25636,14 @@ class DesktopPetApp(object):
         full_folder = tk.StringVar()
         live2d_model = tk.StringVar()
         character_mode = tk.StringVar(value="静态立绘")
-        tk.Label(
+        mode_label = tk.Label(
             form,
             text="角色类型",
             bg=BRAND_COLORS["panel"],
             fg=BRAND_COLORS["white"],
             anchor="w",
-        ).grid(row=2, column=0, sticky="nw", padx=16, pady=6)
+        )
+        mode_label.grid(row=2, column=0, sticky="nw", padx=16, pady=6)
         mode_box = ttk.Combobox(
             form,
             textvariable=character_mode,
@@ -25618,6 +25654,9 @@ class DesktopPetApp(object):
         mode_box.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(10, 16), pady=6)
         mode_box.configure(state="disabled")
         self._configure_live2d_emotion_popup(mode_box)
+        # Retain the static-mode value and future type-switching implementation.
+        mode_label.grid_remove()
+        mode_box.grid_remove()
         personality_field = tk.Frame(form, bg=BRAND_COLORS["panel"])
         personality_field.grid(
             row=3, column=1, columnspan=2, sticky="ew", padx=(10, 16), pady=6

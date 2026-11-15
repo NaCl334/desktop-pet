@@ -39,9 +39,33 @@ def classify_voice_issue(error, runtime_complete=True, diagnostic=""):
     return VoiceIssue("unknown", "语音处理未完成，暂时无法确定原因。可再次检查，或复制错误信息。", "retry")
 
 
-def local_environment_status(client):
+def environment_fingerprint():
+    from core.gpt_sovits import ENGINE_DIR
+    result = []
+    for name in ("runtime/python.exe", "venv/Scripts/python.exe", "api_v2.py", "start_api.py",
+                 "GPT_SoVITS", "tts_infer_project.yaml"):
+        path = ENGINE_DIR / name
+        try:
+            stat = path.stat()
+            result.append((name, stat.st_size, stat.st_mtime_ns))
+        except OSError:
+            result.append((name, None, None))
+    return tuple(result)
+
+
+def installation_failure(error, install=True):
+    return {"state": "failed", "text": str(error),
+            "action": "install" if install else "repair", "environment_repair": not install,
+            "action_label": "重新安装语音服务" if install else "修复并启动",
+            "installation_failure": True, "environment_fingerprint": environment_fingerprint()}
+
+
+def local_environment_status(client, failure=None):
     """A skipped installation is different from an installed, broken runtime."""
     from core.gpt_sovits import ENGINE_DIR, runtime_ready
+    if (failure and failure.get("installation_failure") and client.host in LOCAL_HOSTS
+            and failure.get("environment_fingerprint") == environment_fingerprint()):
+        return failure
     if client.host not in LOCAL_HOSTS or runtime_ready():
         return None
     installed = any((ENGINE_DIR / name).exists() for name in ("GPT_SoVITS", "venv", "runtime"))

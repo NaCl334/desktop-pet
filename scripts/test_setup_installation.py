@@ -28,6 +28,7 @@ class DownloadHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         offset = int(self.headers.get("Range", "bytes=0-").split("=")[1].split("-")[0])
         self.server.offsets.append(offset)
+        self.server.accepts.append(self.headers.get("Accept"))
         if self.path == "/ignore":
             offset = 0
         self.send_response(206 if offset else 200)
@@ -47,6 +48,7 @@ class SetupDownloadTests(unittest.TestCase):
     def setUpClass(cls):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), DownloadHandler)
         cls.server.offsets = []
+        cls.server.accepts = []
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
 
@@ -64,6 +66,7 @@ class SetupDownloadTests(unittest.TestCase):
         self.digest = hashlib.sha256(PAYLOAD).hexdigest()
         self.url = "http://127.0.0.1:{}/".format(self.server.server_port)
         self.server.offsets.clear()
+        self.server.accepts.clear()
 
     def download(self, endpoint="ok", **kwargs):
         return installer.download_verified(self.url + endpoint, self.target,
@@ -84,6 +87,13 @@ class SetupDownloadTests(unittest.TestCase):
         self.download()
         self.assertEqual(self.target.read_bytes(), PAYLOAD)
         self.assertEqual(self.server.offsets, [127])
+
+    def test_octet_stream_header_keeps_resume_and_hash_checks(self):
+        self.partial.write_bytes(PAYLOAD[:127])
+        self.download(request_headers={'Accept': 'application/octet-stream'})
+        self.assertEqual(self.server.accepts, ['application/octet-stream'])
+        self.assertEqual(self.server.offsets, [127])
+        self.assertEqual(self.target.read_bytes(), PAYLOAD)
 
     def test_server_ignoring_range_restarts_without_duplicate_bytes(self):
         self.partial.write_bytes(PAYLOAD[:127])
@@ -130,6 +140,9 @@ class SetupTransactionTests(unittest.TestCase):
         tool_patch = patch.object(installer, "install_lgpl_tools")
         self.lgpl_install = tool_patch.start()
         self.addCleanup(tool_patch.stop)
+        prefetch_patch = patch.object(installer, "obtain_lgpl_archive")
+        self.lgpl_prefetch = prefetch_patch.start()
+        self.addCleanup(prefetch_patch.stop)
         self.folder = tempfile.TemporaryDirectory(dir=ROOT / "temp")
         self.addCleanup(self.folder.cleanup)
         self.root = Path(self.folder.name)
@@ -219,6 +232,20 @@ class SetupTransactionTests(unittest.TestCase):
         self.assertEqual(config["custom"]["version"], "v2Pro")
         self.assertFalse(any((self.root / "temp/setup_staging").glob("voice_*")))
 
+    def test_ffmpeg_failure_happens_before_voice_extraction_and_keeps_pack(self):
+        self.lgpl_prefetch.side_effect = installer.SetupError('FFmpeg 下载失败')
+        before = self.package.read_bytes()
+        with patch.object(installer, 'detect_environment', return_value={}), \
+                patch.object(installer, 'preflight_space'), \
+                patch.object(installer, 'voice_package', return_value={}), \
+                patch.object(installer, '_obtain_package', return_value=self.package), \
+                patch.object(installer, '_unpack_voice') as unpack:
+            with self.assertRaisesRegex(installer.SetupError, 'FFmpeg'):
+                installer.install_profile('full')
+        unpack.assert_not_called()
+        self.assertEqual(self.package.read_bytes(), before)
+        self.assertFalse((self.root / 'temp/setup_staging').exists())
+
     def test_failure_after_relocation_restores_previous_directory(self):
         if sys.platform != "win32":
             self.skipTest("Windows installer")
@@ -236,6 +263,7 @@ class SetupTransactionTests(unittest.TestCase):
 
     def test_existing_ready_environment_is_checked_without_download(self):
         with patch.object(installer, "detect_environment", return_value=READY), \
+                patch.object(installer.shutil, "disk_usage", return_value=Mock(free=100*1024**3)), \
                 patch.object(installer, "_obtain_package") as obtain, \
                 patch.object(installer, "_validate_engine") as validate:
             installer.install_profile("full")
@@ -262,12 +290,13 @@ class SetupTransactionTests(unittest.TestCase):
         self.assertFalse(self.engine.exists())
 
     def test_disk_space_failure_happens_before_download(self):
-        with patch.object(installer, "detect_environment", return_value={}), \
+        with patch.object(installer, "detect_environment", return_value={}) as detect, \
                 patch.object(installer.shutil, "disk_usage", return_value=Mock(free=1024)), \
                 patch.object(installer, "_obtain_package") as obtain:
             with self.assertRaisesRegex(installer.SetupError, "32 GiB"):
                 installer.install_profile("full")
         obtain.assert_not_called()
+        detect.assert_not_called()
 
     def test_retries_are_bounded_and_never_install_on_failure(self):
         package = dict(PACKAGES["standard"], urls=["http://127.0.0.1/a"]*3)

@@ -10,8 +10,8 @@ from PIL import Image, ImageTk
 
 from core.branding import ICON_PATH, LOGO_PATH
 from core.config import ROOT
-from core.installer import SetupError, install_profile
-from core.install_location import install_in_directory
+from core.installer import SetupError, install_profile, preflight_space
+from core.install_location import install_in_directory, validate_install_dir
 from core.setup_packages import VOICE_ENGINE_LABEL
 
 
@@ -39,6 +39,7 @@ class SetupWizard:
         self._page = 0
         self._poll_after = None
         self._close_after = None
+        self._component_states = {}
 
     def show(self):
         if self.dialog is not None and self.dialog.winfo_exists():
@@ -60,8 +61,12 @@ class SetupWizard:
         height = min(round(660 * scale), max(540, dialog.winfo_screenheight() - 80))
         dialog.geometry("{}x{}".format(width, height))
         dialog.minsize(min(width, round(680 * scale)), min(height, round(540 * scale)))
+        dialog.resizable(True, True)
         dialog.configure(bg="white")
-        dialog.transient(self.root)
+        # An independent normal window remains available in the Windows taskbar,
+        # even while the desktop-pet root itself is hidden.
+        if os.name == "nt":
+            dialog.attributes("-toolwindow", False)
         dialog.protocol("WM_DELETE_WINDOW", self.cancel)
         dialog.grid_columnconfigure(0, weight=1)
         dialog.grid_rowconfigure(1, weight=1)
@@ -93,7 +98,7 @@ class SetupWizard:
         tk.Label(self.welcome, text="让她陪在你的桌面上", bg="white", fg="#202936",
             font=("Microsoft YaHei UI", 12, "bold"), anchor="w").pack(anchor="w", pady=(8, 16))
         tk.Label(self.welcome,
-            text="选择运行方式，确认本地语音环境。\n\n现有角色、立绘和聊天记录会继续保留。",
+            text="选择运行方式，确认本地语音环境。\n\n原地配置会保留现有数据；安装到其他位置不会自动迁移角色和配置。",
             bg="white", fg="#4c596b", font=("Microsoft YaHei UI", 10),
             justify="left", anchor="nw").pack(fill="x")
 
@@ -109,6 +114,10 @@ class SetupWizard:
         self.location_entry.pack(side="left", fill="x", expand=True)
         self.location_button = ttk.Button(location_row, text="浏览…", command=self.choose_location)
         self.location_button.pack(side="right", padx=(8, 0))
+        self.location_error = tk.Label(self.options, text="", bg="white", fg="#bd3232",
+            anchor="w", justify="left", wraplength=610)
+        self.location_error.pack(fill="x", pady=(0, 4))
+        self.location_var.trace_add("write", lambda *_: self._validate_location())
         self.profile_choices = {}
         for profile, label in (("desktop", "仅使用桌宠"), ("full", "桌宠与本地语音（{}）".format(VOICE_ENGINE_LABEL))):
             # Keep one shared choice selected, even when its checkmark is clicked again.
@@ -130,9 +139,12 @@ class SetupWizard:
         names = {"live2d": "Live2D（可选）", "python": "Python", "torch": "语音计算环境", "compute": "运算设备",
                  "ffmpeg": "音频处理", "gpt_sovits_runtime": VOICE_ENGINE_LABEL + " 引擎", "gpt_sovits_model": "v2Pro 基础语音模型"}
         self.component_status_labels = {}
-        for row, (key, item) in enumerate(self.report.get("components", {}).items()):
+        for key, item in self.report.get("components", {}).items():
             if key not in names:
                 continue
+            if key == "live2d" and not item.get("available"):
+                continue
+            row = len(self.component_status_labels)
             tk.Label(self.details, text=names[key], bg="white", fg="#4c596b",
                      anchor="w", font=("Microsoft YaHei UI", 9)).grid(row=row, column=0, sticky="w", padx=(4, 28), pady=2)
             status = tk.Label(self.details, text="已就绪" if item.get("available") else "未就绪",
@@ -149,6 +161,10 @@ class SetupWizard:
         self.completion_message = tk.Label(self.completion, bg="white", fg="#4c596b",
             font=("Microsoft YaHei UI", 10), justify="left", anchor="nw", wraplength=610)
         self.completion_message.pack(fill="x")
+        self.original_directory_button = tk.Button(self.completion, text="打开原目录位置",
+            command=self._open_original_directory, padx=12, pady=6, relief="solid", bd=1,
+            bg="white", fg="#2175bf", activebackground="#e5eef7",
+            font=("Microsoft YaHei UI", 9), cursor="hand2")
 
         footer = tk.Frame(dialog, bg="#f6f7f9", highlightbackground="#e5e9ee", highlightthickness=1)
         footer.grid(row=2, column=0, sticky="ew")
@@ -190,7 +206,7 @@ class SetupWizard:
         self.back_button.pack(side="left", padx=(0, 8))
         self.install_button = button("下一步", self.next_page, True)
         self.install_button.pack(side="left", padx=(0, 8))
-        self.close_button = button("取消", self.cancel)
+        self.close_button = button("关闭向导", self.cancel)
         self.close_button.pack(side="left")
         self.refresh_details()
         self._show_page(0)
@@ -208,9 +224,34 @@ class SetupWizard:
             self.back_button.pack(side="left", padx=(0, 8), before=self.install_button)
         self.install_button.configure(text="下一步" if page == 0 else "开始配置")
         self.heading.configure(text=("欢迎使用我的桌宠", "选择运行方式", "配置完成")[page])
+        if page == 1:
+            self._validate_location()
+
+    def _validate_location(self):
+        error = validate_install_dir(self.location_var.get())
+        self.location_error.configure(text=error or "")
+        if hasattr(self, "install_button") and self._page == 1 and not (
+                self.worker is not None and self.worker.is_alive()):
+            self.install_button.configure(state="disabled" if error else "normal")
+        return error
+
+    def _open_original_directory(self):
+        try:
+            os.startfile(str(ROOT.resolve()))
+        except OSError as error:
+            messagebox.showerror("打开目录失败", str(error), parent=self.dialog)
 
     def _show_completion(self, title, message, on_close=None):
         self._show_page(2)
+        if self.install_directory != ROOT.resolve():
+            message += ("\n\n程序已安装到：\n{}\n\n原目录仍保留：\n{}\n"
+                        "确认新版可用后，可手动删除原目录。\n"
+                        "原目录中的角色和配置不会自动迁移到新位置。\n"
+                        "原数据位置：原目录下 characters、data、config、models 文件夹。"
+                        ).format(self.install_directory, ROOT.resolve())
+            self.original_directory_button.pack(anchor="w", pady=(12, 0))
+        else:
+            self.original_directory_button.pack_forget()
         self.completion_title.configure(text=title)
         self.completion_message.configure(text=message)
         self.status_var.set("")
@@ -262,8 +303,8 @@ class SetupWizard:
     def refresh_details(self):
         profile = self.profile_var.get()
         self.detail_var.set("无需安装本地语音组件；需要语音时可另行配置 {}。".format(VOICE_ENGINE_LABEL) if profile == "desktop" else
-            "缺少环境时自动下载官方 GPT-SoVITS v2Pro 整合包（约 8.2–8.9 GB），需要至少 32 GiB 可用空间。"
-            "安装到上方目录，支持断点续传；已有完整环境直接复用。角色音色另行导入。")
+            "缺少环境时自动下载官方 GPT-SoVITS v2Pro 整合包（约 8.2–8.9 GB），"
+            "安装位置需预留 32 GiB。支持断点续传，安装成功后自动清理下载包；角色音色另行导入。")
         for key, label in getattr(self, "component_status_labels", {}).items():
             item = self.report.get("components", {}).get(key, {})
             unused = profile == "desktop" and key != "python"
@@ -272,18 +313,33 @@ class SetupWizard:
                 "已就绪" if item.get("available") else "待配置")
             label.configure(text=text, fg="#687484" if unused else
                             "#27805a" if item.get("available") else "#b75c2a")
+            if not unused and key in self._component_states:
+                state = self._component_states[key]
+                label.configure(text=state, fg="#27805a" if state == "已就绪" else
+                                "#b75c2a" if state == "未完成" else "#2175bf")
 
     def start_install(self):
         if self.worker is not None and self.worker.is_alive():
             return
         profile = self.profile_var.get()
+        if self._validate_location():
+            return
         selected = self.location_var.get().strip()
         if not selected or not Path(selected).is_absolute():
             self.status_var.set("请选择有效的绝对安装路径。")
             return
         self.install_directory = Path(selected).expanduser().resolve()
+        cache = self.install_directory / "temp"
+        try:
+            if profile == "full":
+                preflight_space(self.install_directory, cache)
+        except (SetupError, OSError) as error:
+            self.status_var.set(str(error))
+            return
         self.needs_character = self._initial_needs_character or self.install_directory != ROOT.resolve()
         self.cancel_event.clear()
+        self._component_states.clear()
+        self.refresh_details()
         self.location_entry.configure(state="disabled")
         self.location_button.configure(state="disabled")
         for choice in self.profile_choices.values():
@@ -300,9 +356,11 @@ class SetupWizard:
             try:
                 notify = lambda text: self._events.put(("progress", text))
                 if self.install_directory == ROOT.resolve():
-                    report = install_profile(profile, progress=notify, cancel_event=self.cancel_event)
+                    report = install_profile(profile, progress=notify, cancel_event=self.cancel_event,
+                        cache_dir=cache, keep_cache=False)
                 else:
-                    report = install_in_directory(self.install_directory, profile, notify, self.cancel_event)
+                    report = install_in_directory(self.install_directory, profile, notify, self.cancel_event,
+                        cache_dir=cache, keep_cache=False)
                 if isinstance(report, dict) and "components" in report:
                     self._events.put(("report", report))
                 self._events.put(("done", profile, True, ""))
@@ -330,8 +388,12 @@ class SetupWizard:
                 self.status_var.set(value.get("text", "") if isinstance(value, dict) else value)
                 if isinstance(value, dict) and value.get("percent") is not None:
                     self._set_progress(value["percent"])
+                if isinstance(value, dict) and value.get("component") and value.get("state"):
+                    self._component_states[value["component"]] = value["state"]
+                    self.refresh_details()
             elif event[0] == "report":
                 self.report = event[1]
+                self._component_states.clear()
                 self.refresh_details()
             else:
                 self.finish_install(*event[1:])
@@ -352,14 +414,18 @@ class SetupWizard:
             if self.on_finished:
                 self.on_finished(profile, True)
         else:
+            self._component_states = {key: (state if state == "已就绪" else "未完成")
+                                      for key, state in self._component_states.items()}
+            self.refresh_details()
             self.location_entry.configure(state="normal")
             self.location_button.configure(state="normal")
             for choice in self.profile_choices.values():
                 choice.configure(state="normal")
             self.status_var.set("配置未完成：{}".format(error))
             self.install_button.configure(state="normal", text="重试")
+            self._validate_location()
             self.back_button.configure(state="normal")
-            self.close_button.configure(text="关闭")
+            self.close_button.configure(text="关闭向导")
             if self.on_finished:
                 self.on_finished(profile, False)
 
@@ -385,14 +451,17 @@ class SetupWizard:
         self.dialog = None
 
     def _dismiss(self):
+        # The dismissal callback may shut down the application and its Tk root.
+        self._close_after_success()
         if not self._dismissed_notified and self.on_dismissed:
             self._dismissed_notified = True
             self.on_dismissed()
-        self._close_after_success()
 
     def cancel(self):
         self.cancel_event.set()
         if self.worker is not None and self.worker.is_alive():
-            self.status_var.set("正在取消…")
+            for widget in (self.install_button, self.back_button, self.close_button):
+                widget.configure(state="disabled")
+            self.status_var.set("正在取消，请稍候…")
             return
         self._dismiss()

@@ -309,6 +309,7 @@ class GPTSoVITSClient(object):
                     environment.pop(key, None)
                 environment["PYTHONUTF8"] = "1"
                 environment["PYTHONIOENCODING"] = "utf-8:replace"
+                environment["PYTHONDONTWRITEBYTECODE"] = "1"
                 environment["PATH"] = os.pathsep.join((str(ENGINE_DIR / "ffmpeg"),
                     str(ENGINE_DIR / "runtime"), str(ENGINE_DIR), environment.get("PATH", "")))
                 try:

@@ -62,7 +62,7 @@ class VoiceServicePanel(tk.Frame):
         try:
             from core.gpt_sovits import GPTSoVITSClient
             from core.voice_service_repair import local_environment_status
-            environment = local_environment_status(self.client) if isinstance(self.client, GPTSoVITSClient) else None
+            environment = local_environment_status(self.client, failure=baseline) if isinstance(self.client, GPTSoVITSClient) else None
             if environment:
                 result = environment
                 return

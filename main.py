@@ -176,6 +176,10 @@ def run_desktop_pet():
     if options.character_package and not options.character:
         raise ValueError("角色包启动参数缺少角色 ID。")
     if _acquire_single_instance():
+        from core.uninstaller import check_startup_uninstall
+        from core.config import ROOT
+        if check_startup_uninstall(ROOT):
+            return
         startup_errors = []
         target = options.character
         if options.character_package:

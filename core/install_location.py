@@ -1,17 +1,67 @@
 """Deploy a fresh application and configure it with its own executable."""
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import time
 import uuid
+import tempfile
 
 from core.config import ROOT
-from core.installer import SetupError, _check_cancel, _notify
+from core.installer import SetupError, _check_cancel, _notify, preflight_space
 
 
-def install_in_directory(destination, profile, progress=None, cancel_event=None):
+def validate_install_dir(path):
+    """返回安装位置错误；只在最近的现有祖先中试写，绝不创建安装目录。"""
+    try:
+        raw = str(path).strip()
+        if not raw or not Path(raw).expanduser().is_absolute():
+            return "请选择有效的绝对安装路径。"
+        if len(raw) > 180:
+            return "路径过长，请选择不超过 180 个字符的安装位置。"
+        target = Path(raw).expanduser().resolve()
+        if len(str(target)) > 180:
+            return "路径过长，请选择不超过 180 个字符的安装位置。"
+        if target == Path(target.anchor):
+            return "不能装到磁盘根目录。"
+        for name, fallback, message in (
+            ("SystemRoot", r"C:\Windows", "不能装到系统目录。"),
+            ("ProgramFiles", r"C:\Program Files", "不能装到 Program Files，请选择用户目录或非系统盘。"),
+            ("ProgramFiles(x86)", r"C:\Program Files (x86)", "不能装到 Program Files，请选择用户目录或非系统盘。"),
+        ):
+            protected = Path(os.environ.get(name, fallback)).resolve()
+            if target == protected or protected in target.parents:
+                return message
+        if os.name == "nt":
+            import ctypes
+            get_type = ctypes.windll.kernel32.GetDriveTypeW
+            get_type.argtypes = [ctypes.c_wchar_p]
+            get_type.restype = ctypes.c_uint
+            if get_type(target.anchor) in (2, 4) or str(target).startswith("\\\\"):
+                return "不支持安装到移动磁盘或网络位置。"
+            if get_type(target.anchor) != 3:
+                return "请选择可用的本地固定磁盘。"
+        ancestor = target
+        while not ancestor.exists():
+            if ancestor == ancestor.parent:
+                return "安装位置不存在或不可访问。"
+            ancestor = ancestor.parent
+        if not ancestor.is_dir():
+            return "安装位置必须是文件夹。"
+        with tempfile.TemporaryFile(prefix=".desktop_pet_write_", dir=ancestor):
+            pass
+        return None
+    except (OSError, ValueError, RuntimeError):
+        return "没有写入权限或路径无效，请换一个位置。"
+
+
+def install_in_directory(destination, profile, progress=None, cancel_event=None,
+                         cache_dir=None, keep_cache=False):
+    error = validate_install_dir(destination)
+    if error:
+        raise SetupError(error)
     target = Path(destination).expanduser().resolve()
     source = ROOT.resolve()
     if target == source or target in source.parents:
@@ -30,6 +80,8 @@ def install_in_directory(destination, profile, progress=None, cancel_event=None)
         if owned.get("source") != str(source):
             raise SetupError("所选目录不为空，请选择空文件夹，避免覆盖现有文件。")
     _check_cancel(cancel_event)
+    if profile == "full":
+        preflight_space(target, cache_dir)
     target.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps({"source": str(source)}), encoding="utf-8")
     executable = target / "我的桌宠.exe"
@@ -72,6 +124,11 @@ def install_in_directory(destination, profile, progress=None, cancel_event=None)
         shutil.copy2(sys.executable, partial)
         partial.replace(executable)
     _check_cancel(cancel_event)
+    settings_file = target / "data/settings.json"
+    settings = json.loads(settings_file.read_text(encoding="utf-8")) if settings_file.exists() else {}
+    if cache_dir is not None:
+        settings.update(setup_cache_dir=str(cache_dir), keep_setup_cache=bool(keep_cache))
+        settings_file.write_text(json.dumps(settings), encoding="utf-8")
     status_path = target / "temp" / ("setup_" + uuid.uuid4().hex + ".jsonl")
     process = subprocess.Popen(
         [str(executable), "--setup-worker", profile, str(status_path)], cwd=target,
@@ -93,6 +150,8 @@ def install_in_directory(destination, profile, progress=None, cancel_event=None)
                         offset += len(line.encode("utf-8"))
                         if event["kind"] == "progress" and progress:
                             progress(event["value"])
+                        elif event["kind"] == "error":
+                            result = {"success": False, "error": event.get("error", "配置失败")}
                         elif event["kind"] == "result":
                             result = event
             if result is not None or exited:
@@ -151,6 +210,7 @@ def run_setup_worker(profile, status_file):
             emit("result", success=True, report=report)
             success = True
         except Exception as error:
+            emit("error", error=str(error), error_type=type(error).__name__)
             emit("result", success=False, error=str(error))
         finally:
             finished.set()
